@@ -101,7 +101,8 @@ func TestCLILifecycleOfflineThreeRuntime(t *testing.T) {
 		}
 	}
 	// The embedded catalog projects seven quality-assurance skills plus the
-	// reasoning-family maintainer-delivery skill on every runtime. Asserting
+	// reasoning-family maintainer-delivery and documentation-family odd-roadmap
+	// skills on every runtime. Asserting
 	// the whole set in sorted order keeps the check honest: a count alone
 	// would also pass for the wrong skills.
 	expectedSkillIDs := []string{
@@ -116,7 +117,7 @@ func TestCLILifecycleOfflineThreeRuntime(t *testing.T) {
 		"skills/test-runner",
 	}
 	// Pi additionally binds one actor per general-core role, so its manifest
-	// carries six actor artifacts alongside the eight skills.
+	// carries six actor artifacts alongside the nine skills.
 	expectedPiLogicalIDs := []string{
 		"actors/adversarial-tester",
 		"actors/evidence-auditor",

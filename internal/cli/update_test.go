@@ -445,11 +445,19 @@ func TestUpdatePlanReportsModeDrift(t *testing.T) {
 		t.Fatalf("setup apply = (%d, %q, %q)", code, stdout, stderr)
 	}
 	manifest := updateStateIdentity(t, root)
-	if len(manifest.Artifacts()) == 0 {
-		t.Fatal("no artifacts installed")
+	const targetLogicalID = "skills/requirements-analyst"
+	var targetArtifact installstate.Artifact
+	found := false
+	for _, artifact := range manifest.Artifacts() {
+		if artifact.LogicalID() == targetLogicalID {
+			targetArtifact, found = artifact, true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("installed manifest has no %s artifact", targetLogicalID)
 	}
 
-	targetArtifact := manifest.Artifacts()[0]
 	targetPath := filepath.Join(root, filepath.FromSlash(targetArtifact.RelativePath()))
 	mustOK(os.Chmod(targetPath, 0o640))
 
@@ -470,4 +478,3 @@ func TestUpdatePlanReportsModeDrift(t *testing.T) {
 		t.Fatalf("stdout %q does not have status=planned or contains status=conflict", stdout)
 	}
 }
-

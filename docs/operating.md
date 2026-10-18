@@ -82,6 +82,58 @@ Default mode touches nothing — run the plan first, read it, then decide. `--ap
 - Never treat a zero exit from `qa run` as passing test evidence: it is a report about the request you supplied, not a test execution.
 - Never run `install`/`update --apply`/`uninstall` against a machine the user did not explicitly hand you for this purpose.
 
+## ODD roadmap workflow
+
+Product direction is coordinated through the ODD roadmap practice. These rules bind
+anyone planning, starting, or contributing work in this repository.
+
+- The living index issue (#288) is the single source for sequencing and readiness.
+  [ROADMAP.md](../ROADMAP.md) holds the static narrative; this index holds the approved
+  order and the current state.
+- Approved outcomes are GitHub milestones. A family or track becomes a milestone only
+  through a maintainer-approved revision appended to the index; approved revisions are
+  never rewritten, only appended with a new proposal marker.
+- Each ODD work unit carries its own plan in its issue: scope, acceptance criteria, and
+  checks. Local ODD task documents (`odd/tasks/<feature>.md`) mirror the specs verbatim
+  for execution tracking and are not a substitute for the issue.
+- Readiness gates contribution: an issue is contribution-ready only when its plan is
+  complete and its readiness conditions are resolved. Nothing is announced as ready
+  while a decision is pending.
+- Ideas without an approved milestone stay un-prioritized and create no issues
+  automatically. Bugs and small tasks keep the normal issue-first flow without ODD
+  treatment.
+- No dates and no promised versions anywhere in the workflow.
+
+## Prior install-state schemas
+
+Cortex classifies prior installs with schema 1 or 2. A prior install state this build
+cannot classify blocks install and update by design; the refusal names itself instead of
+an opaque transaction failure:
+
+- `cortex install` reports `reason=install_state_schema_unsupported prior_schema=N supported=1,2`.
+- `cortex doctor` reports `note=install_state_schema_unsupported runtime=... prior_schema=N supported=1,2 remedy=...` and exits non-zero, so its exit code stays honest about install readiness.
+
+Operator path when blocked: adopt the prior state through a guided update where one is
+offered, or archive the stale state (the `.cortex` directory and the projected files it
+lists) and reinstall. Archiving means a dated backup directory outside the runtime —
+never deletion.
+
+## Configure your QA route
+
+The QA fleet ships no models: the route policy's `nan` provider is a placeholder, and
+Cortex applies no model fallback. Each owner configures their own route through a
+user-owned profile file in the catalog root:
+
+```json
+{"schemaVersion":1,"defaultProfile":"my-route","profiles":{"my-route":{"routes":{"evidence-auditor":{"pi":{"provider":"nan","model":"glm5.3","effort":"high"}}}}}}
+```
+
+Location: `<catalog-root>/cortex/qa-profiles.json` (mode 0600, regular file). The
+`defaultProfile` applies to every `qa run` without a `--profile` flag; pass
+`--profile <id>` to select another profile for one run. When the pinned model is
+absent from the runtime's effective catalog, `qa run` refuses at preflight with
+`model_unavailable` and prints this setup path — no launch, no silent fallback.
+
 ## Where to read more
 
 - [Architecture overview](architecture/overview.md) — the target product contract (authority).

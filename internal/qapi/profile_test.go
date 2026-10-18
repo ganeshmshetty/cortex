@@ -13,6 +13,19 @@ import (
 	"github.com/refactor-ia/cortex/internal/qarole"
 )
 
+func TestProfileRouteHonorsDefaultProfileWithoutFlag(t *testing.T) {
+	root := testProfileRoot(t)
+	data := []byte(`{"schemaVersion":1,"defaultProfile":"balanced","profiles":{"balanced":{"routes":{"evidence-auditor":{"pi":{"provider":"nan","model":"glm5.3","effort":"high"}}}}}}`)
+	writeProfile(t, root, data)
+
+	got, failure := resolveProfileRoute(root, AdmissionRequest{
+		Role: qarole.EvidenceAuditor, Backend: "pi",
+	})
+	if failure.Code != "" || got.Model != "glm5.3" || got.Provider != "nan" || got.ProfileID != "balanced" {
+		t.Fatalf("resolveProfileRoute() = (%+v, %q), want the file's defaultProfile route", got, failure.Code)
+	}
+}
+
 func TestProfileRouteDefaultBypassesProfileSource(t *testing.T) {
 	got, failure := resolveProfileRoute(filepath.Join(t.TempDir(), "missing"), AdmissionRequest{
 		Role: qarole.ExploratoryTester, Backend: "pi",
@@ -104,13 +117,17 @@ func TestProfileRouteRejectsInvalidSources(t *testing.T) {
 	}
 }
 
-func TestProfileRoutePreservesRouteFailuresWithoutDefaults(t *testing.T) {
+func TestProfileRouteHonorsProfileDefinedModels(t *testing.T) {
+	// A profile-covered role resolves with the profile's own provider/model
+	// even when they differ from the placeholder defaults (issue #298:
+	// each owner routes with their own). Roles a profile does not cover
+	// still fail with route_incomplete — no silent default fallback.
 	root := testProfileRoot(t)
 	writeProfile(t, root, []byte(`{"schemaVersion":1,"defaultProfile":"balanced","profiles":{"balanced":{"routes":{"exploratory-tester":{"pi":{"provider":"nan","model":"qwen3.6","effort":"high"}}}}}}`))
 
 	got, failure := resolveProfileRoute(root, AdmissionRequest{Role: qarole.ExploratoryTester, Backend: "pi", Profile: "balanced"})
-	if failure.Code != "route_disallowed" || got.PolicyVersion != "" {
-		t.Fatalf("resolveProfileRoute() = (%+v, %q), want route_disallowed without glm5.3 fallback", got, failure.Code)
+	if failure.Code != "" || got.Model != "qwen3.6" || got.ProfileID != "balanced" {
+		t.Fatalf("resolveProfileRoute() = (%+v, %q), want the profile-defined route", got, failure.Code)
 	}
 }
 

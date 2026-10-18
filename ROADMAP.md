@@ -17,6 +17,10 @@ The foundation phase built those guarantees and proved them. The next phase is
 collaboration as a first-class delivery path. New horizontal infrastructure requires a
 demonstrated need (see issue #175).
 
+Sequencing and readiness are coordinated through the living ODD roadmap index
+(issue #288, described in the [operating guide](docs/operating.md)); this document
+holds the narrative, the index holds the approved order.
+
 ## Current state (honest)
 
 | Area | State |
@@ -74,7 +78,7 @@ These run only when they unblock A/B:
 
 - Seam compatibility from measured negotiated contracts, not parsed version strings
   (#235).
-- Detect Gentle AI capability overlap before it becomes a yield (#207).
+- Detect Gentle-AI™ capability overlap before it becomes a yield (#207).
 - Implement the project constitution (#146) and the fork-first policy (#3) as their
   child issues define.
 

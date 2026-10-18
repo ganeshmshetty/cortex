@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -69,7 +70,7 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 	case "--version":
 		return runVersion(stdout, stderr)
 	case "doctor":
-		return runDoctor(ctx, stdout, stderr, runner, install.policy)
+		return runDoctor(ctx, stdout, stderr, runner, install.policy, skillroot.ResolveSystemUninstallRoots)
 	case "qa":
 		return runQA(ctx, args[1:], stdout, stderr)
 	case "update":
@@ -89,7 +90,7 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 	}
 }
 
-func runDoctor(ctx context.Context, stdout, stderr io.Writer, runner runtimeprobe.Runner, policy runtimecompat.Policy) int {
+func runDoctor(ctx context.Context, stdout, stderr io.Writer, runner runtimeprobe.Runner, policy runtimecompat.Policy, resolveRoots func() ([]skillroot.UninstallRoot, error)) int {
 	matrix, err := probeCompatibilityMatrix(ctx, runner, policy)
 	if err != nil {
 		writeError(stderr, "probe_failed")
@@ -98,6 +99,16 @@ func runDoctor(ctx context.Context, stdout, stderr io.Writer, runner runtimeprob
 	if _, err := io.WriteString(stdout, doctorReport(ctx, matrix)); err != nil {
 		writeError(stderr, "output_failed")
 		return exitFailure
+	}
+	// The prior install-state probe keeps doctor exit 0 honest: a prior state
+	// this build cannot classify blocks install, so the same blocking condition
+	// install will hit is named here with its remedy (issue #281).
+	notes, blocked := doctorPriorStateBlocker(resolveRoots)
+	if notes != "" {
+		if _, err := io.WriteString(stdout, notes+"\n"); err != nil {
+			writeError(stderr, "output_failed")
+			return exitFailure
+		}
 	}
 	// The exit code answers whether an install can proceed, not whether every
 	// runtime is certified. An admitted uncertified version is disclosed in the
@@ -109,16 +120,55 @@ func runDoctor(ctx context.Context, stdout, stderr io.Writer, runner runtimeprob
 			return exitUnknown
 		}
 	}
+	if blocked {
+		return exitConflict
+	}
 	return exitOK
 }
 
+// doctorPriorStateBlocker reads each resolved runtime root's install-state.json
+// and reports the schemas this build cannot classify. It parses only the
+// schemaVersion field: classification stays in install; doctor only needs the
+// schema number to name the same blocking condition install will hit.
+func doctorPriorStateBlocker(resolveRoots func() ([]skillroot.UninstallRoot, error)) (string, bool) {
+	roots, err := resolveRoots()
+	if err != nil {
+		return "", false
+	}
+	notes := make([]string, 0, len(roots))
+	for _, root := range roots {
+		data, err := os.ReadFile(filepath.Join(root.RootPath(), ".cortex", "install-state.json"))
+		if err != nil {
+			continue
+		}
+		var version struct {
+			SchemaVersion *int `json:"schemaVersion"`
+		}
+		if json.Unmarshal(data, &version) != nil || version.SchemaVersion == nil {
+			continue
+		}
+		if installobserve.PriorSchemaSupported(*version.SchemaVersion) {
+			continue
+		}
+		notes = append(notes, fmt.Sprintf(
+			"note=install_state_schema_unsupported runtime=%s prior_schema=%d supported="+installobserve.SupportedPriorSchemas+" remedy=adopt the prior state through a guided update or archive it and reinstall",
+			root.RuntimeID(), *version.SchemaVersion))
+	}
+	return strings.Join(notes, "\n"), len(notes) > 0
+}
+
 const (
-	qaUsage = "usage: cortex qa run --role <role> --request <file> --catalog <dir> [--backend pi|claude|opencode] [--evidence <file.json>]\n"
+	qaUsage = "usage: cortex qa run --role <role> --request <file> --catalog <dir> [--backend pi|claude|opencode] [--evidence <file.json>] [--profile <id>]\n" +
+		"usage: cortex qa setup --catalog <dir> --provider <p> --model <m> [--effort <e>]\n"
 	qaHelp = qaUsage + "\nQA evaluates evidence and does not run tests.\n" +
 		"Write a short, bounded plain-text request (request.txt):\n" +
 		"printf 'R1: Responses must finish within 100 ms.\\nR2: Responses must wait at least 500 ms.\\nIdentify the contradiction; do not edit files.\\n' > request.txt\n" +
 		"Use a catalog root directory containing catalog.json (for example, ./catalog):\n" +
-		"cortex qa run --role requirements-analyst --request request.txt --catalog ./catalog\n"
+		"cortex qa run --role requirements-analyst --request request.txt --catalog ./catalog\n" +
+		"Optional evidence sidecar (--evidence evidence.json): a JSON array of execution records\n" +
+		`[{"id":"selected-test","command":"go test ./...","exit_code":0,"output_tail":"ok example","provenance":"caller fixture","truncated":false}]` + "\n" +
+		"To audit a code diff, prefix every diff line with '>' (blockquote): quoted lines are content,\n" +
+		"so frame directives stay rejected while the quoted diff passes validation (issue #305).\n"
 	rootHelp = "usage: cortex <command> [arguments]\ncommands: doctor, install, update, uninstall, qa\noptions: --version, --help\n\n" + qaHelp
 	// qaReportNote surfaces runtime prerequisites on non-catalog failures.
 	// The default route provider is the policy placeholder "nan"; Cortex applies
@@ -151,6 +201,9 @@ var qaPiResolver qapi.PathResolver
 // runQA executes one local QA report command. It never mutates user
 // configuration and never claims admission.
 func runQA(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "setup" {
+		return runQASetup(ctx, args[1:], stdout, stderr)
+	}
 	if len(args) == 0 || len(args) == 1 && args[0] == "--help" || len(args) == 2 && args[0] == "run" && args[1] == "--help" {
 		return writeHelp(stdout, stderr, qaHelp)
 	}
@@ -159,11 +212,11 @@ func runQA(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		_, _ = io.WriteString(stderr, qaUsage)
 		return exitUsage
 	}
-	backend, evidencePath := "pi", ""
+	backend, evidencePath, profile := "pi", "", ""
 	seen := map[string]bool{}
 	for index := 7; index < len(args); index += 2 {
 		flag, value := args[index], args[index+1]
-		if value == "" || seen[flag] || flag != "--backend" && flag != "--evidence" {
+		if value == "" || seen[flag] || flag != "--backend" && flag != "--evidence" && flag != "--profile" {
 			writeError(stderr, "invalid_arguments")
 			_, _ = io.WriteString(stderr, qaUsage)
 			return exitUsage
@@ -207,7 +260,7 @@ func runQA(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return qaFailure(stderr, "actor_unavailable")
 	}
 	report, code, err := qapi.RunLocalReportOn(ctx, qapi.ReportRequest{
-		Role: role, CatalogRoot: catalogRoot, InstallRoot: installRoot,
+		Role: role, Profile: profile, CatalogRoot: catalogRoot, InstallRoot: installRoot,
 		CurrentDirectory: cwd, Task: task, Evidence: evidence, TimeoutSeconds: qaadmission.DefaultTimeoutSeconds,
 	}, backend, qaPiResolver)
 	if err != nil || code != "" {
@@ -218,6 +271,15 @@ func runQA(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return exitFailure
 		}
 		failure := qaFailure(stderr, string(code))
+		if diagnostic := qaAdmissionDiagnostic(err); diagnostic != "" {
+			_, _ = io.WriteString(stderr, diagnostic)
+		}
+		if err != nil && strings.Contains(err.Error(), "stream_retained=") {
+			_, _ = fmt.Fprintf(stderr, "%s\n", err.Error())
+		}
+		if code == qaadmission.CodeModelUnavailable {
+			_, _ = io.WriteString(stderr, qaRouteSetupNote(catalogRoot))
+		}
 		if code == qaadmission.CodeNormalizationFailed {
 			var diagnostic *qapi.ReportNormalizationError
 			if errors.As(err, &diagnostic) {
@@ -237,6 +299,28 @@ func qaFailure(stderr io.Writer, code string) int {
 	writeError(stderr, code)
 	_, _ = io.WriteString(stderr, qaReportNote)
 	return exitFailure
+}
+
+// qaRouteSetupNote names the user-owned profile file and its shape, so an
+// unavailable pinned model leads to configuration instead of guessing. The
+// fleet ships no models: each owner routes with their own (issue #298).
+func qaRouteSetupNote(catalogRoot string) string {
+	example := `{"schemaVersion":1,"defaultProfile":"my-route","profiles":{"my-route":{"routes":{"evidence-auditor":{"pi":{"provider":"nan","model":"glm5.3","effort":"high"}}}}}}`
+	return fmt.Sprintf("route_setup=%s/cortex/qa-profiles.json example=%s\n", catalogRoot, example)
+}
+
+// qaAdmissionDiagnostic renders one bounded diagnostic line for admission
+// failures, naming the stage and the expected/found identity (issue #294).
+// Digests and the catalog fingerprint are the only values it may carry.
+func qaAdmissionDiagnostic(err error) string {
+	var unavailable *installobserve.AdmissionUnavailableError
+	if !errors.As(err, &unavailable) {
+		return ""
+	}
+	if unavailable.Expected == "" && unavailable.Found == "" {
+		return fmt.Sprintf("admission_stage=%s\n", unavailable.Stage)
+	}
+	return fmt.Sprintf("admission_stage=%s expected=%s found=%s\n", unavailable.Stage, unavailable.Expected, unavailable.Found)
 }
 
 func readRequestTask(path string) ([]byte, error) {

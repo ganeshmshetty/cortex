@@ -11,6 +11,7 @@ import (
 
 	"os/exec"
 
+	"github.com/refactor-ia/cortex/internal/installobserve"
 	"github.com/refactor-ia/cortex/internal/installtxn"
 	"github.com/refactor-ia/cortex/internal/projection"
 	"github.com/refactor-ia/cortex/internal/runtimecompat"
@@ -46,6 +47,125 @@ func canonicalHome(t *testing.T) string {
 	return home
 }
 
+func TestInstallFailureReasonNamesUnsupportedPriorSchema(t *testing.T) {
+	reason, code := installFailureReason(errors.Join(installtxn.ErrInvalid, &installobserve.UnsupportedPriorStateError{PriorSchema: 3}))
+	if reason != "install_state_schema_unsupported prior_schema=3 supported=1,2" || code != exitConflict {
+		t.Fatalf("installFailureReason(unsupported prior) = (%q, %d)", reason, code)
+	}
+	if reason, code := installFailureReason(installtxn.ErrConflict); reason != "ownership_conflict" || code != exitConflict {
+		t.Fatalf("installFailureReason(conflict) = (%q, %d)", reason, code)
+	}
+	if reason, code := installFailureReason(errors.New("other")); reason != "transaction_failed" || code != exitTransaction {
+		t.Fatalf("installFailureReason(other) = (%q, %d)", reason, code)
+	}
+}
+
+func TestCanonicalWorkingDirectoryResolvesSymlinks(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PWD", link)
+	t.Chdir(link)
+	// t.TempDir() sits under /var (itself a symlink to /private/var on macOS),
+	// so the expectation is the fully resolved real path.
+	expected, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := canonicalWorkingDirectory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != expected {
+		t.Fatalf("canonicalWorkingDirectory() = %q, want the real path %q", resolved, expected)
+	}
+}
+
+// A plain working directory is returned unchanged: the canonicalizer must not
+// rewrite or reject the ordinary case (issue #306 refusal regression).
+func TestCanonicalWorkingDirectoryKeepsPlainWorkingDirectory(t *testing.T) {
+	plain := filepath.Join(must(filepath.EvalSymlinks(t.TempDir())), "plain")
+	mustOK(os.MkdirAll(plain, 0o700))
+	resolved, err := canonicalWorkingDirectoryIn(plain)
+	if err != nil || resolved != plain {
+		t.Fatalf("canonicalWorkingDirectoryIn(plain) = (%q, %v)", resolved, err)
+	}
+}
+
+// Resolution fails closed: a path that cannot be resolved to a real one is an
+// error, never a silent fallback to the logical path (issue #306, QA #286
+// verdict F1). This keeps install/update aligned with QA's
+// canonicalRuntimeDirectory on the failure semantics too.
+func TestCanonicalWorkingDirectoryFailsClosedOnUnresolvablePath(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	if resolved, err := canonicalWorkingDirectoryIn(missing); err == nil {
+		t.Fatalf("canonicalWorkingDirectoryIn(missing) = %q, want an error", resolved)
+	}
+}
+
+func TestRunInstallSucceedsFromSymlinkedWorkingDirectory(t *testing.T) {
+	home := canonicalHome(t)
+	deps := compatibleInstallDependencies(t, home)
+	var stdout, stderr bytes.Buffer
+	real := filepath.Join(home, "real-cwd")
+	mustOK(os.MkdirAll(real, 0o700))
+	link := filepath.Join(home, "link-cwd")
+	mustOK(os.Symlink(real, link))
+	t.Setenv("PWD", link)
+	t.Chdir(link)
+	if code := runWithInstallDependencies(context.Background(), []string{"install"}, &stdout, &stderr, certifiedPiOnlyRunner(), deps); code != exitOK {
+		t.Fatalf("install from symlinked cwd exit = %d, stderr = %q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "operation=install status=completed touch=applied") {
+		t.Fatalf("install output = %q", stdout.String())
+	}
+}
+
+// The shadow scanner must see the real path behind the invocation symlink: a
+// cortex-named shadow planted under the real working directory is rejected
+// even when install is invoked from the link (issue #306, QA #286 verdict on
+// the "same security stance" claim).
+func TestRunInstallRejectsShadowPlantedUnderRealPathFromSymlinkedCWD(t *testing.T) {
+	home := canonicalHome(t)
+	deps := compatibleInstallDependencies(t, home)
+	real := filepath.Join(home, "real-cwd")
+	mustOK(os.MkdirAll(real, 0o700))
+	link := filepath.Join(home, "link-cwd")
+	mustOK(os.Symlink(real, link))
+	shadowPath := filepath.Join(real, ".pi", "agents", "cortex-test-designer.md")
+	mustOK(os.MkdirAll(filepath.Dir(shadowPath), 0o700))
+	mustOK(os.WriteFile(shadowPath, []byte("---\nname: cortex-test-designer\n---\n"), 0o600))
+	t.Setenv("PWD", link)
+	t.Chdir(link)
+	var stdout, stderr bytes.Buffer
+	if code := runWithInstallDependencies(context.Background(), []string{"install"}, &stdout, &stderr, certifiedPiOnlyRunner(), deps); code == exitOK {
+		t.Fatalf("install from symlinked cwd with a shadow under the real path exited OK: %q", stdout.String())
+	}
+}
+
+// The mutating update path shares the canonicalizer; it must behave the same
+// from a symlinked invocation directory (issue #306, QA #286 gap 4).
+func TestRunUpdateSucceedsFromSymlinkedWorkingDirectory(t *testing.T) {
+	home := canonicalHome(t)
+	deps := compatibleInstallDependencies(t, home)
+	var stdout, stderr bytes.Buffer
+	if code := runWithInstallDependencies(context.Background(), []string{"install"}, &stdout, &stderr, certifiedPiOnlyRunner(), deps); code != exitOK {
+		t.Fatalf("install exit = %d, stderr = %q", code, stderr.String())
+	}
+	real := filepath.Join(home, "real-cwd")
+	mustOK(os.MkdirAll(real, 0o700))
+	link := filepath.Join(home, "link-cwd")
+	mustOK(os.Symlink(real, link))
+	t.Setenv("PWD", link)
+	t.Chdir(link)
+	stdout.Reset()
+	if code := runWithInstallDependencies(context.Background(), []string{"update"}, &stdout, &stderr, certifiedPiOnlyRunner(), deps); code != exitOK {
+		t.Fatalf("update from symlinked cwd exit = %d, stderr = %q", code, stderr.String())
+	}
+}
+
 func TestRunInstallCompatibleFreshRoot(t *testing.T) {
 	home := canonicalHome(t)
 	deps := compatibleInstallDependencies(t, home)
@@ -69,7 +189,7 @@ func TestRunInstallCompatibleFreshRoot(t *testing.T) {
 		t.Fatalf("install state = %v", err)
 	}
 	stdout.Reset()
-	if code := runWithInstallDependencies(context.Background(), []string{"update"}, &stdout, &stderr, certifiedPiOnlyRunner(), deps); code != exitOK || !strings.Contains(stdout.String(), "unchanged=15") {
+	if code := runWithInstallDependencies(context.Background(), []string{"update"}, &stdout, &stderr, certifiedPiOnlyRunner(), deps); code != exitOK || !strings.Contains(stdout.String(), "unchanged=17") {
 		t.Fatalf("idempotent update = (%d, %q)", code, stdout.String())
 	}
 }
